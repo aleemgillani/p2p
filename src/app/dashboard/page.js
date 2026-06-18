@@ -1,27 +1,27 @@
 'use client';
 import { useSession, signOut } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import Link from 'next/link';
 
 const CHUNK_SIZE = 64 * 1024;
+
+// Use only reliable, free STUN servers.
+// For production behind symmetric NAT/firewalls, deploy your own TURN server
+// (e.g., coturn, Metered.ca, or Twilio).
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
-  ]
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+  ],
+  iceCandidatePoolSize: 10,
 };
+
+const ICE_TIMEOUT_MS = 30000;
 
 export default function Dashboard() {
   const { data: session, status } = useSession();
@@ -46,6 +46,13 @@ export default function Dashboard() {
   const currentFileMetaRef = useRef(null);
   const startTimeRef = useRef(null);
   const bytesSentRef = useRef(0);
+  const transferStatusRef = useRef('idle');
+  const iceCandidateQueueRef = useRef([]);
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    transferStatusRef.current = transferStatus;
+  }, [transferStatus]);
 
   useEffect(() => {
     if (status === 'unauthenticated') router.push('/login');
@@ -66,7 +73,14 @@ export default function Dashboard() {
   function initSocket() {
     if (socketRef.current) socketRef.current.disconnect();
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
-    const socket = io();
+    iceCandidateQueueRef.current = [];
+
+    const socket = io(window.location.origin, {
+      transports: ['websocket', 'polling'],
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      timeout: 10000,
+    });
     socketRef.current = socket;
     return socket;
   }
@@ -99,6 +113,7 @@ export default function Dashboard() {
     socket.on('connect_error', (err) => {
       console.error('[Sender] Socket error:', err);
       setConnectionStatus('Connection error. Please refresh and try again.');
+      setTransferStatus('idle');
     });
 
     socket.on('receiver-joined', () => {
@@ -112,6 +127,18 @@ export default function Dashboard() {
       if (pcRef.current) {
         try {
           await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+          console.log('[Sender] Remote description (answer) set');
+
+          // Flush queued ICE candidates
+          console.log(`[Sender] Flushing ${iceCandidateQueueRef.current.length} queued ICE candidates`);
+          for (const candidate of iceCandidateQueueRef.current) {
+            try {
+              await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (e) {
+              console.warn('[Sender] Queued ICE candidate error:', e.message);
+            }
+          }
+          iceCandidateQueueRef.current = [];
         } catch (err) {
           console.error('[Sender] Error setting answer:', err);
         }
@@ -119,14 +146,27 @@ export default function Dashboard() {
     });
 
     socket.on('ice-candidate', async ({ candidate }) => {
-      if (pcRef.current && candidate) {
-        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+      if (!candidate) return;
+
+      // Queue if remote description not set yet
+      if (!pcRef.current || !pcRef.current.remoteDescription) {
+        console.log('[Sender] Queuing ICE candidate (remote description not set yet)');
+        iceCandidateQueueRef.current.push(candidate);
+        return;
+      }
+
+      try {
+        await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('[Sender] ICE candidate error:', e.message);
       }
     });
 
     socket.on('peer-disconnected', () => {
-      if (transferStatus !== 'done') {
+      if (transferStatusRef.current !== 'done') {
         setConnectionStatus('Receiver disconnected.');
+        setTransferStatus('idle');
+        setShowPopup(false);
       }
     });
   }
@@ -139,11 +179,26 @@ export default function Dashboard() {
       if (e.candidate) socket.emit('ice-candidate', { roomId: rId, candidate: e.candidate });
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log('[Sender] Connection state:', pc.connectionState);
+    pc.oniceconnectionstatechange = () => {
+      console.log('[Sender] ICE connection state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed') {
+        console.log('[Sender] ICE failed, attempting restart...');
+        pc.restartIce();
+      }
     };
 
-    const dataChannel = pc.createDataChannel('fileTransfer', { ordered: true });
+    pc.onconnectionstatechange = () => {
+      console.log('[Sender] Connection state:', pc.connectionState);
+      if (pc.connectionState === 'failed') {
+        setConnectionStatus('Connection failed. Try connecting from a different network.');
+        setTransferStatus('idle');
+        setShowPopup(false);
+      }
+    };
+
+    const dataChannel = pc.createDataChannel('fileTransfer', {
+      ordered: true,
+    });
     dataChannelRef.current = dataChannel;
 
     dataChannel.onopen = () => {
@@ -157,13 +212,17 @@ export default function Dashboard() {
     };
 
     dataChannel.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'file-done') {
-        console.log('[Sender] Transfer complete!');
-        setTransferStatus('done');
-        setConnectionStatus('Transfer complete!');
-        setProgress(100);
-        setShowPopup(false);
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'file-done') {
+          console.log('[Sender] Transfer complete!');
+          setTransferStatus('done');
+          setConnectionStatus('Transfer complete!');
+          setProgress(100);
+          setShowPopup(false);
+        }
+      } catch (err) {
+        console.warn('[Sender] Unexpected message on data channel:', e.data);
       }
     };
 
@@ -171,9 +230,20 @@ export default function Dashboard() {
       console.error('[Sender] Data channel error:', err);
     };
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.emit('offer', { roomId: rId, offer });
+    dataChannel.onclose = () => {
+      console.log('[Sender] Data channel closed');
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('offer', { roomId: rId, offer });
+      console.log('[Sender] Offer sent');
+    } catch (err) {
+      console.error('[Sender] Error creating offer:', err);
+      setConnectionStatus('Failed to create connection offer. Please try again.');
+      setTransferStatus('idle');
+    }
   }
 
   async function sendAllFiles(dataChannel) {
@@ -184,6 +254,7 @@ export default function Dashboard() {
       const file = files[i];
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
+      // Send metadata
       dataChannel.send(JSON.stringify({
         type: 'meta',
         fileName: file.name,
@@ -194,10 +265,21 @@ export default function Dashboard() {
         totalFiles: files.length
       }));
 
+      // Send file chunks
       for (let chunk = 0; chunk < totalChunks; chunk++) {
+        // Backpressure: wait if buffer is too full
         while (dataChannel.bufferedAmount > 1024 * 1024) {
           await new Promise(r => setTimeout(r, 50));
         }
+
+        // Check if data channel is still open
+        if (dataChannel.readyState !== 'open') {
+          console.error('[Sender] Data channel closed during transfer');
+          setConnectionStatus('Transfer interrupted. Receiver may have disconnected.');
+          setTransferStatus('idle');
+          return;
+        }
+
         const start = chunk * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const data = await file.slice(start, end).arrayBuffer();
@@ -209,13 +291,17 @@ export default function Dashboard() {
         setProgress(pct);
 
         const elapsed = (Date.now() - startTimeRef.current) / 1000;
-        if (elapsed > 0) {
+        if (elapsed > 0.5) {
           const spd = totalSent / elapsed;
-          setSpeed(spd > 1024 * 1024 ? (spd / (1024 * 1024)).toFixed(2) + ' MB/s' : (spd / 1024).toFixed(1) + ' KB/s');
+          setSpeed(spd > 1024 * 1024
+            ? (spd / (1024 * 1024)).toFixed(1) + ' MB/s'
+            : (spd / 1024).toFixed(0) + ' KB/s');
         }
       }
 
+      // Signal end of file
       dataChannel.send(JSON.stringify({ type: 'file-end', fileIndex: i }));
+      console.log(`[Sender] File ${i + 1}/${files.length} sent: ${file.name}`);
     }
   }
 
@@ -241,6 +327,16 @@ export default function Dashboard() {
       socket.emit('join-room', rId);
     });
 
+    socket.on('connect_error', () => {
+      setConnectionStatus('Could not connect to server. Please try again.');
+      setTransferStatus('idle');
+    });
+
+    socket.on('room-not-found', () => {
+      setConnectionStatus('Transfer room not found. The sender may have closed their browser.');
+      setTransferStatus('idle');
+    });
+
     socket.on('joined-as-receiver', () => {
       setConnectionStatus('Connected! Waiting for files...');
     });
@@ -249,6 +345,17 @@ export default function Dashboard() {
       try {
         if (!pcRef.current) initReceiverPC(socket, rId);
         await pcRef.current.setRemoteDescription(new RTCSessionDescription(offer));
+
+        // Flush queued ICE candidates
+        for (const candidate of iceCandidateQueueRef.current) {
+          try {
+            await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+          } catch (e) {
+            console.warn('[Dashboard Receiver] Queued ICE error:', e.message);
+          }
+        }
+        iceCandidateQueueRef.current = [];
+
         const answer = await pcRef.current.createAnswer();
         await pcRef.current.setLocalDescription(answer);
         socket.emit('answer', { roomId: rId, answer });
@@ -260,8 +367,17 @@ export default function Dashboard() {
     });
 
     socket.on('ice-candidate', async ({ candidate }) => {
-      if (pcRef.current && candidate) {
-        try { await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+      if (!candidate) return;
+
+      if (!pcRef.current || !pcRef.current.remoteDescription) {
+        iceCandidateQueueRef.current.push(candidate);
+        return;
+      }
+
+      try {
+        await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('[Dashboard Receiver] ICE candidate error:', e.message);
       }
     });
 
@@ -271,8 +387,9 @@ export default function Dashboard() {
     });
 
     socket.on('peer-disconnected', () => {
-      if (transferStatus !== 'done') {
+      if (transferStatusRef.current !== 'done') {
         setConnectionStatus('Sender disconnected.');
+        setTransferStatus('idle');
       }
     });
   }
@@ -284,6 +401,21 @@ export default function Dashboard() {
 
     pc.onicecandidate = (e) => {
       if (e.candidate) socket.emit('ice-candidate', { roomId: rId, candidate: e.candidate });
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('[Dashboard Receiver] ICE state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed') {
+        pc.restartIce();
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('[Dashboard Receiver] Connection state:', pc.connectionState);
+      if (pc.connectionState === 'failed') {
+        setConnectionStatus('Connection failed. Try a different network.');
+        setTransferStatus('idle');
+      }
     };
 
     pc.ondatachannel = (e) => {
@@ -315,6 +447,10 @@ export default function Dashboard() {
           setProgress(Math.round((received / total) * 100));
         }
       };
+
+      dataChannel.onclose = () => {
+        console.log('[Dashboard Receiver] Data channel closed');
+      };
     };
   }
 
@@ -342,6 +478,7 @@ export default function Dashboard() {
   function resetSender() {
     if (socketRef.current) socketRef.current.disconnect();
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+    iceCandidateQueueRef.current = [];
     setTransferStatus('idle');
     setFiles([]);
     setProgress(0);
@@ -354,6 +491,7 @@ export default function Dashboard() {
   function resetReceiver() {
     if (socketRef.current) socketRef.current.disconnect();
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+    iceCandidateQueueRef.current = [];
     setTransferStatus('idle');
     setReceivedFiles([]);
     setProgress(0);
@@ -496,7 +634,7 @@ export default function Dashboard() {
                   {transferStatus === 'transferring' && (
                     <>
                       <div className="bg-gray-800 rounded-full h-3 mt-6 mb-2">
-                        <div className="bg-blue-600 h-3 rounded-full transition-all" style={{ width: progress + '%' }}></div>
+                        <div className="bg-blue-600 h-3 rounded-full transition-all duration-300" style={{ width: progress + '%' }}></div>
                       </div>
                       <p className="text-gray-400 text-sm">{progress}% — {speed}</p>
                     </>
@@ -561,7 +699,7 @@ export default function Dashboard() {
                   {transferStatus === 'transferring' && (
                     <>
                       <div className="bg-gray-800 rounded-full h-3 mt-4 mb-2">
-                        <div className="bg-green-600 h-3 rounded-full transition-all" style={{ width: progress + '%' }}></div>
+                        <div className="bg-green-600 h-3 rounded-full transition-all duration-300" style={{ width: progress + '%' }}></div>
                       </div>
                       <p className="text-gray-400 text-sm">{progress}%</p>
                     </>
