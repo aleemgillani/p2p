@@ -237,22 +237,23 @@ export default function ReceivePage() {
             console.log('[Receiver] Receiving file:', msg.fileName, 'size:', msg.fileSize);
           }
           if (msg.type === 'file-end') {
-            const blob = new Blob(chunksRef.current, { type: metaRef.current?.fileType || 'application/octet-stream' });
+            const meta = metaRef.current;
+            const blob = new Blob(chunksRef.current, { type: meta?.fileType || 'application/octet-stream' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = metaRef.current?.fileName || 'download';
+            a.download = meta?.fileName || 'download';
             a.click();
 
             setReceivedFiles(prev => [...prev, {
-              name: metaRef.current?.fileName,
-              size: metaRef.current?.fileSize,
+              name: meta?.fileName || 'download',
+              size: meta?.fileSize || 0,
               url
             }]);
 
             // Check if this is the last file
-            const isLastFile = (msg.fileIndex !== undefined && metaRef.current?.totalFiles)
-              ? (msg.fileIndex + 1) >= metaRef.current.totalFiles
+            const isLastFile = (msg.fileIndex !== undefined && meta?.totalFiles)
+              ? (msg.fileIndex + 1) >= meta.totalFiles
               : true;
 
             if (isLastFile) {

@@ -48,6 +48,7 @@ export default function Dashboard() {
   const bytesSentRef = useRef(0);
   const transferStatusRef = useRef('idle');
   const iceCandidateQueueRef = useRef([]);
+  const filesDoneCountRef = useRef(0);
 
   // Keep ref in sync with state
   useEffect(() => {
@@ -215,11 +216,15 @@ export default function Dashboard() {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'file-done') {
-          console.log('[Sender] Transfer complete!');
-          setTransferStatus('done');
-          setConnectionStatus('Transfer complete!');
-          setProgress(100);
-          setShowPopup(false);
+          filesDoneCountRef.current += 1;
+          console.log(`[Sender] File ${filesDoneCountRef.current}/${files.length} acknowledged by receiver`);
+          if (filesDoneCountRef.current >= files.length) {
+            console.log('[Sender] All files transferred!');
+            setTransferStatus('done');
+            setConnectionStatus('Transfer complete!');
+            setProgress(100);
+            setShowPopup(false);
+          }
         }
       } catch (err) {
         console.warn('[Sender] Unexpected message on data channel:', e.data);
@@ -437,6 +442,10 @@ export default function Dashboard() {
             setConnectionStatus(`Receiving: ${msg.fileName}`);
           }
           if (msg.type === 'file-end') {
+            // Store fileIndex in meta for reconstructFile to use
+            if (currentFileMetaRef.current && msg.fileIndex !== undefined) {
+              currentFileMetaRef.current.fileIndex = msg.fileIndex;
+            }
             reconstructFile();
             dataChannel.send(JSON.stringify({ type: 'file-done' }));
           }
@@ -456,11 +465,22 @@ export default function Dashboard() {
 
   function reconstructFile() {
     const meta = currentFileMetaRef.current;
+    if (!meta) return;
     const blob = new Blob(receivedChunksRef.current, { type: meta.fileType });
     const url = URL.createObjectURL(blob);
     setReceivedFiles(prev => [...prev, { name: meta.fileName, size: meta.fileSize, url }]);
-    setTransferStatus('done');
-    setConnectionStatus('File received!');
+
+    // Only mark done if this is the last file
+    const isLastFile = (meta.fileIndex !== undefined && meta.totalFiles)
+      ? (meta.fileIndex + 1) >= meta.totalFiles
+      : true;
+
+    if (isLastFile) {
+      setTransferStatus('done');
+      setConnectionStatus('All files received!');
+    } else {
+      setConnectionStatus(`Received ${meta.fileIndex + 1}/${meta.totalFiles} files...`);
+    }
 
     const a = document.createElement('a');
     a.href = url;
@@ -479,6 +499,7 @@ export default function Dashboard() {
     if (socketRef.current) socketRef.current.disconnect();
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     iceCandidateQueueRef.current = [];
+    filesDoneCountRef.current = 0;
     setTransferStatus('idle');
     setFiles([]);
     setProgress(0);

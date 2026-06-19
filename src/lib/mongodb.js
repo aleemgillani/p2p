@@ -16,10 +16,25 @@ async function connectDB() {
   if (cached.conn) return cached.conn;
 
   if (!cached.promise) {
-    cached.promise = mongoose.connect(MONGODB_URI).then((mongoose) => mongoose);
+    cached.promise = mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 10000,
+    }).then((mongoose) => {
+      console.log('MongoDB connected successfully');
+      return mongoose;
+    }).catch((err) => {
+      cached.promise = null;
+      console.error('MongoDB connection error:', err.message);
+      throw new Error('Database connection failed. Make sure MongoDB is running.');
+    });
   }
 
-  cached.conn = await cached.promise;
+  try {
+    cached.conn = await cached.promise;
+  } catch (err) {
+    cached.promise = null;
+    throw err;
+  }
   return cached.conn;
 }
 
